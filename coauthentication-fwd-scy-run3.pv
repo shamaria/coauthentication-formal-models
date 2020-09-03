@@ -1,0 +1,195 @@
+(*Enforcing forward secrecy on Coauthentication protocol*)
+
+(*Use an active attacker*)
+set attacker = active.
+
+(*Public communication channels*)
+free c: channel.
+free cARM: channel.
+free cACM: channel.
+
+(*Private communication channel between devices and mechanisms*)
+free cRRM: channel[private].
+free cAAM: channel[private].
+free cCCM: channel[private].
+
+(*Private communication channel between Requestor mechanism and collaborator mechanism*)
+free cCRM: channel[private].
+
+(*Type declarations*)
+type key.
+type nonce.
+type host.
+type tag.
+
+
+
+(*Ids of Authenticator, Requestor, and Collaborator*)
+free A,R,C: host.
+
+(*Tables for registered devices and their associated keys*)
+table keys(host,key).
+table oldkeys(host,key).
+table registeredDevices(host,host).
+
+(*A secret session key*)
+free session_key_test:bitstring [private].
+
+(*Constants for labeling messages*)
+const access_req:tag [data].
+const collab_req:tag [data].
+const collab_res: tag [data].
+const acknowledgement: bitstring [data].
+
+(*Secrecy queries*)
+query attacker (session_key_test).
+
+(*Authentication queries*)
+
+(*Requestor believes that it initiated an authentication protocol with Authenticator*)
+event beginA (host,host,host,nonce).
+(*Authenticator believes that it finished an authentication process*)
+event endA(host,host,host,nonce,nonce).
+
+(*Authenticator believes that Requestor requested an access request. *)
+event beginR(host,host,host,nonce).
+(*Requestor believes that it finished the authentication protocol with the Authenticator*)
+event endR(host,host,host,nonce).
+
+(*Collaborator believes that it received a collaboration request from an associated device and responds to the collaboration request*)
+event collabA(host,host,host).
+event collabR(host,host,host).
+
+(*Authentication of R to A*)
+query h1:host, h2:host,h3:host, n:nonce, n2:nonce; event(endA(h1,h2,h3,n,n2)) ==> (inj-event (collabA(h1,h2,h3)) && inj-event(beginA(h1,h2,h3,n))).
+
+(*Authentication of A to R*)
+query h1:host, h2:host, h3:host, n:nonce; event(endR(h1,h2,h3,n)) ==> (inj-event (collabR(h1,h2,h3)) && inj-event(beginR(h1,h2,h3,n))).
+
+(*Symmetric key encryption and decryption functions*)
+fun encrypt(bitstring,key): bitstring.
+reduc forall x: bitstring, y: key; decrypt(encrypt(x,y),y) = x.
+
+(*Authenticator process*)
+let Authenticator =
+  in(cAAM, (xR: host, m:bitstring)); (* 3- AM ----> A*)
+  get oldkeys(=xR,k_ar:key) in (*Get the key of the device *)
+  let (=access_req, n1:nonce) = decrypt(m, k_ar) in (*decrypt message*)
+  get registeredDevices (=xR, xC:host) in (*check if xR is registered with xC*)
+  event beginR(A,xR,xC,n1);
+  get oldkeys(=xC,k_ac:key) in (* get the key of collaborating device*)
+  new n2: nonce;
+  let cipher =encrypt((collab_req,xC,n2),k_ar) in
+  out (cAAM, (A, encrypt((xR,cipher),k_ac))); (* 4- A ---> AM*)
+  in (cAAM,(=xR, m2:bitstring)); (*Wait for the response*)
+  let (=collab_res, =xC, =n2) = decrypt(m2, k_ar) in (*Check the collaboration request*)
+  new session_key: key; (*Generate a session key*)
+  out (cAAM, (A, encrypt((xC, session_key,session_key_test,n1),k_ar))); (*13- A ---> AM*)
+  in (cAAM, m3: bitstring);
+  let(=acknowledgement) = decrypt(m3,session_key) in (*Check the acknowledgement after establishing a session key*)
+  event endA(A,xR,xC,n1,n2).
+
+let AuthenticatorMech =
+  in(cARM, (xR:host, m:bitstring)); (*2- RM ---> AM*)
+  get keys(=xR, k_ar: key) in (*get the new key of the device*)
+    let (=access_req, n1:nonce) = decrypt (m, k_ar) in (*decrypt message*)
+      get oldkeys(=xR, k_arOld: key) in (*get old k_ar*)
+      out (cAAM, (xR, encrypt((access_req,n1),k_arOld))); (*3- AM ----> A*)
+      in (cAAM, (=A, m2:bitstring)); (*4- A ----> AM*)
+      get registeredDevices(=xR, xC:host) in (*get collaborator*)
+      get oldkeys(=xC, k_acOld:key) in (*get collaborator old key*)
+      let (=xR, cipher:bitstring) = decrypt (m2, k_acOld) in
+      let (=collab_req, =xC,n2:nonce) = decrypt(cipher,k_arOld) in
+      new k_ar1: key; (*Generate new keys*)
+      new k_ar2: key;
+      let cipher1 = encrypt((collab_req,xC,n2,k_ar1,k_ar2),k_ar) in
+      out (cACM, (A, encrypt((xR,cipher1),k_acOld)));
+      in (cARM, (=xR,m3:bitstring)); (*Wait for the response from the collaborator through the requestor*)
+      let (=collab_res,=xC,=n2) = decrypt(m3,k_ar1) in
+      out (cAAM,(xR,encrypt((collab_res,xC,n2),k_arOld))); (*Forward message with old encrypted key*)
+      in (cAAM, (=A, m4:bitstring));(*Wait for message from authenticator*)
+      let (=xC,session_key:key,=session_key_test,=n1) = decrypt(m4,k_arOld) in (*Decrypt and reencrypt with new key*)
+      out(cARM,(A,encrypt((xC,session_key,session_key_test,n1),k_ar1))); (*Send session key*)
+      in (cARM, m5:bitstring);
+      out (cAAM, m5); (*forward ack*)
+      phase 1; insert keys(xR, k_ar2). (*Update R's key at the end of the session*)
+
+
+let Requestor =
+  in(c, xR:host); (*Let the environment decide  which device the requestor is going to be*)
+  get registeredDevices(=xR,xC:host) in (*Get the associated device*)
+  get oldkeys(=xR,k_ar: key) in (*Get the key*)
+  new n1:nonce; (*New nonce*)
+  event beginA(A, xR, xC, n1);
+  out (cRRM, (xR, encrypt((access_req, n1),k_ar))); (*1- R---->RM*)
+  in (cRRM, (=A,m:bitstring)); (*9- RM-----> R*)
+  let (=collab_req,=xC,n2:bitstring) = decrypt(m,k_ar) in
+  out (cRRM, (xR, encrypt((collab_res,xC,n2),k_ar))); (*10- R-----> RM*)
+  in (cRRM,(=A,m2:bitstring)); (*15- RM ------> R*)
+  let (=xC,session_key:key,=session_key_test,=n1) = decrypt(m2,k_ar) in
+  out (cRRM, encrypt(acknowledgement,session_key)); (*16- R--------> RM*)
+  event endR(A,xR,xC,n1).
+
+
+
+let RequestorMechanism =
+  in (cRRM,(xR: host,m:bitstring)); (*Intercept authentication reqeust 1- R----> RM*)
+  get oldkeys(=xR,k_ar: key) in (*Get old key*)
+  let (=access_req,n1:nonce) = decrypt(m,k_ar) in (*decrypt*)
+  get keys(=xR, k_ar1:key) in (*Get new key for forward secrecy*)
+  out (cARM,(xR, encrypt((access_req,n1),k_ar1))); (*re-encrypt with new key and send 2- RM-----> AM*)
+  in (cCRM, (=A, m2: bitstring)); (*Wait for collab req*)
+  let (=collab_req,xC:host,n2:bitstring,k_ar2:key,k_ar3:key) = decrypt(m2,k_ar1) in (*Extract new keys*)
+  out (cRRM, (A,encrypt((collab_req,xC,n2),k_ar))); (*Forward expected message encrypted with old key*)
+  in (cRRM, (=xR,m3:bitstring)); (*Wait for collab resp 10- R----> RM*)
+  let (=collab_res, =xC, =n2) = decrypt(m3,k_ar) in (*Decreypt response with old key*)
+  out (cARM, (xR,encrypt((collab_res,xC,n2),k_ar2))); (*Re-encrypt response with new key and send *)
+  in (cARM, (=A,m4:bitstring)); (*Wait for session key*)
+  let (=xC,session_key:key,=session_key_test,=n1) = decrypt(m4,k_ar2) in (* decrypt session key message*)
+  out (cRRM, (A, encrypt((xC,session_key,session_key_test,n1),k_ar))); (*re-encrypt session key with old key*)
+  in (cRRM, (=xR, m5: bitstring)); (*Wait for acknowledgement*)
+  out (cARM, (xR,m5)).(*firward acknowledgement*)
+
+
+
+let Collaborator =
+  in(c, xC: host); (*Let the environement decide which device the collaborator will be*)
+  in (cCCM, (=A,m:bitstring));
+  get registeredDevices (=xC, xR: host) in
+  get oldkeys (=xC, k_ac:key) in
+  let (=xR, cipher: bitstring) = decrypt(m,k_ac) in
+  event collabR (A, xR, xC);
+  event collabA (A, xR, xC);
+  out (cCCM, (A,cipher)).
+
+let CollaboratorMechanism =
+  in(cACM,(=A,m:bitstring));
+  get registeredDevices (=C, xR:host) in
+  get keys (=C, k_ac:key) in
+  let (=xR, cipher:bitstring) = decrypt(m,k_ac) in
+  out (cCCM, (A,m));
+  in (cCCM, (=A, m2:bitstring));
+  out (cCRM, (A,m2)).
+
+process
+
+  (*Create secret keys*)
+  new k_ar:key;
+  new k_ac:key;
+
+  (*Keys table*)
+  insert keys(R, k_ar);
+  insert keys(C, k_ac);
+
+  insert oldkeys(R, k_ar);
+  insert oldkeys(C, k_ac);
+
+  (*Publish requestor's key*)
+  out(c,k_ar);
+
+  (*Associated devices tables*)
+  insert registeredDevices(R,C);
+  insert registeredDevices(C,R);
+
+  (*Init processes*)
+  ((!Authenticator) | (!Requestor)|(!Collaborator) |(!AuthenticatorMech) | (!RequestorMechanism)|(!CollaboratorMechanism)| phase 1; out(c,k_ar))
