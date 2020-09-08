@@ -30,6 +30,7 @@ set attacker = active.
 free c : channel.
 free cAR : channel.
 free cAC : channel.
+free cRC : channel.
 
 
 (* Type declarations *)
@@ -152,4 +153,4 @@ process
     insert registeredDevices(C, R);
 
     (* Init processes *)
-    ((!Authenticator) | (!Requester) | (!Collaborator))
+    ((!Authenticator) | (!Requestor) | (!Collaborator))
